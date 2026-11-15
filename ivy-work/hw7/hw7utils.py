@@ -59,3 +59,95 @@ def period_summary(r, ann=52):
     total = (1 + r).prod() - 1
     return pd.Series({'Start': r.index[0].date(), 'End': r.index[-1].date(),
                       'Cumulative Return': total, 'Annualized': (1 + total) ** (1 / years) - 1})
+
+
+# ---------------------------------------------------------------------------
+# Forecasting SPY helpers
+# ---------------------------------------------------------------------------
+from sklearn.compose import TransformedTargetRegressor
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.neural_network import MLPRegressor
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+
+def make_ols():
+    return LinearRegression()
+
+
+def make_rf():
+    return RandomForestRegressor(max_depth=5, n_estimators=100, random_state=0, n_jobs=-1)
+
+
+def make_nn():
+    """MLP with standardized features and target; predictions come back in the original scale.
+    The scalers are refit on every .fit(), so OOS each step only sees data through t."""
+    net = MLPRegressor(hidden_layer_sizes=(50,), max_iter=1000, random_state=0)
+    return TransformedTargetRegressor(regressor=make_pipeline(StandardScaler(), net),
+                                      transformer=StandardScaler())
+
+
+def lag_align(y, X):
+    """Lag signals one period so row t+1 holds x_t, aligned with the return r_{t+1} it forecasts."""
+    X_lag = X.shift().dropna()
+    y = y.reindex(X_lag.index).dropna()
+    return y, X_lag.loc[y.index]
+
+
+def expanding_mean_forecast(y):
+    """Null forecast: the mean of returns through t, dated t+1."""
+    return y.expanding().mean().shift().dropna()
+
+
+def insample_forecasts(y, X_lag, specs):
+    """Full-sample fitted values. specs maps name -> (signal columns, model factory)."""
+    out = {}
+    for name, (cols, make_model) in specs.items():
+        model = make_model().fit(X_lag[cols], y)
+        out[name] = pd.Series(model.predict(X_lag[cols]), index=y.index)
+    return pd.DataFrame(out)
+
+
+def oos_forecast(y, X_lag, X, cols, make_model, burn):
+    """Expanding-window forecasts: fit on data through t, predict r_{t+1} from x_t, date it t+1."""
+    preds = {}
+    for i in range(burn - 1, len(y)):
+        t = y.index[i]
+        model = make_model().fit(X_lag.loc[:t, cols], y.loc[:t])
+        preds[t] = model.predict(X.loc[[t], cols])[0]
+    # shift so each forecast is stamped with the month it forecasts; the final one is beyond the sample
+    return pd.Series(preds).shift().dropna()
+
+
+def oos_forecasts(y, X_lag, X, specs, burn):
+    return pd.DataFrame({name: oos_forecast(y, X_lag, X, cols, make_model, burn)
+                         for name, (cols, make_model) in specs.items()})
+
+
+def strategy_returns(fcst, y, scale=100):
+    """w_t = scale * forecast of r_{t+1}; strategy return w_t * r_{t+1}. Adds a Passive (w=1) column."""
+    strats = fcst.mul(scale).mul(y, axis=0).dropna()
+    strats.insert(0, 'Passive', y.loc[strats.index])
+    return strats
+
+
+def r2_insample(y, fcst):
+    """Usual R^2 of fitted values against the full-sample mean of y."""
+    y = y.loc[fcst.index]
+    sst = ((y - y.mean()) ** 2).sum()
+    return fcst.apply(lambda f: 1 - ((y - f) ** 2).sum() / sst).rename('R-squared')
+
+
+def r2_oos(y, fcst, null):
+    """1 - MSE(forecast) / MSE(null), over the dates both are available."""
+    idx = fcst.dropna().index.intersection(null.dropna().index)
+    mse_null = ((y.loc[idx] - null.loc[idx]) ** 2).mean()
+    return fcst.loc[idx].apply(lambda f: 1 - ((y.loc[idx] - f) ** 2).mean() / mse_null).rename('OOS R-squared')
+
+
+def plot_cumulative(rets, title):
+    ax = (1 + rets).cumprod().plot(logy=True, figsize=(10, 5), title=title)
+    ax.set_ylabel('Growth of $1 (log scale)')
+    ax.set_xlabel('')
+    return ax
